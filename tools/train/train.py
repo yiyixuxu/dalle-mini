@@ -66,7 +66,7 @@ except:
 
 logger = logging.getLogger(__name__)
 
-cc.initialize_cache("jax_cache")
+#cc.initialize_cache("jax_cache")
 
 
 @dataclass
