@@ -17,7 +17,6 @@
 Training DALL·E Mini.
 Script adapted from run_summarization_flax.py
 """
-
 import io
 import logging
 import os
@@ -615,7 +614,7 @@ def trainable_params(data, embeddings_only):
     }
     return freeze(trainable)
 
-
+# YiYi: this function needs to be changed now params contains "params" and (possibly "batch_stats")
 def init_embeddings(model, params):
     """Reinitialize trainable embeddings"""
     # Must match params in trainable_params() above
@@ -725,6 +724,7 @@ def main():
     for k, v in config_args.items():
         setattr(model.config, k, v)
     params_shape = model.params_shape_tree
+    
 
     # get model metadata
     model_metadata = model_args.get_metadata()
@@ -774,7 +774,7 @@ def main():
     num_train_steps = (
         steps_per_epoch * num_epochs if steps_per_epoch is not None else None
     )
-    num_params = model.num_params(params_shape)
+    num_params = model.num_params(params_shape["params"]) 
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len_train_dataset}")
@@ -859,7 +859,7 @@ def main():
 
     # create optimizer
     trainable_params_shape = trainable_params(
-        params_shape, training_args.embeddings_only
+        params_shape["params"], training_args.embeddings_only
     )
     if training_args.optim == "distributed_shampoo":
         # parameters from https://github.com/tensorflow/lingvo/blob/03ee9d7cd50764b0424c7c863733c91fc0b053ec/lingvo/jax/optimizers.py#L729
@@ -1021,6 +1021,7 @@ def main():
         opt_state: optax.OptState
         apply_fn: Callable = struct.field(pytree_node=False)
         tx: optax.GradientTransformation = struct.field(pytree_node=False)
+        batch_stats: Optional[core.FrozenDict[str, Any]] = None
         dropout_rng: jnp.ndarray = None
         epoch: int = 0
         train_time: float = 0.0  # total time the model trained
@@ -1056,7 +1057,7 @@ def main():
             )
 
         @classmethod
-        def create(cls, *, apply_fn, params, tx, **kwargs):
+        def create(cls, *, apply_fn, params, tx, batch_stats,  **kwargs):
             opt_state = {}
             for k, p in split_params(
                 trainable_params(params, training_args.embeddings_only)
@@ -1070,13 +1071,15 @@ def main():
                 apply_fn=apply_fn,
                 params=params,
                 tx=tx,
+                batch_stats=batch_stats,
                 opt_state=freeze(opt_state),
                 **kwargs,
             )
 
     # define state spec
     state_spec = TrainState(
-        params=param_spec,
+        params=param_spec["params"],
+        batch_stats = param_spec.get("batch_stats"),
         opt_state=opt_state_spec,
         dropout_rng=None,
         step=None,
@@ -1112,7 +1115,8 @@ def main():
                 return TrainState.create(
                     apply_fn=model.__call__,
                     tx=optimizer,
-                    params=maybe_init_params(params),
+                    params=maybe_init_params(params)['params'],
+                    batch_stats=maybe_init_params(params).get('batch_stats'),
                     dropout_rng=dropout_rng,
                     **attr_state,
                 )
@@ -1134,7 +1138,8 @@ def main():
                 return TrainState(
                     apply_fn=model.__call__,
                     tx=optimizer,
-                    params=params,
+                    params=params["params"],
+                    batch_stats = params["batch_stats"],
                     opt_state=opt_state,
                     dropout_rng=dropout_rng,
                     **attr_state,
@@ -1174,7 +1179,11 @@ def main():
     if use_vmap_trick:
         grad_param_spec = jax.tree_util.tree_map(
             lambda x: PartitionSpec(*("dp",) + (x if x is not None else (None,))),
-            param_spec,
+            state_spec.params,
+        )
+        grad_batchstats_spec = jax.tree_util.tree_map(
+            lambda x: PartitionSpec(*("dp",) + (x if x is not None else (None,))),
+            state_spec.batch_stats,
         )
 
     # Define gradient update step fn
@@ -1187,17 +1196,29 @@ def main():
                 batch,
             )
 
-        def compute_loss(params, minibatch, dropout_rng):
+        def compute_loss(params, minibatch, dropout_rng, batch_stats):
             # minibatch has dim (batch_size, ...)
             minibatch, labels = minibatch.pop("labels")
-            logits = state.apply_fn(
-                **minibatch, params=params, dropout_rng=dropout_rng, train=True
+            if batch_stats is not None:
+                out, mutated_variables = state.apply_fn(
+                    **minibatch, 
+                    params={'params':params, 'batch_stats': batch_stats}, 
+                    dropout_rng=dropout_rng, 
+                    train=True,
+                    mutable=['batch_stats'])
+                logits = out[0]
+                new_batch_stats = mutated_variables['batch_stats']
+            else:
+                logits = state.apply_fn(
+                    **minibatch, params={'params':params}, dropout_rng=dropout_rng, train=True
             )[0]
-            return loss_fn(logits, labels)
+                new_batch_stats = None
+            
+            return loss_fn(logits, labels), new_batch_stats
 
-        grad_fn = jax.value_and_grad(compute_loss)
+        grad_fn = jax.value_and_grad(compute_loss,has_aux=True)
 
-        def loss_and_grad(grad_idx, dropout_rng):
+        def loss_and_grad(grad_idx, dropout_rng, batch_stats):
             # minibatch at grad_idx for gradient accumulation (None otherwise)
             minibatch = (
                 get_minibatch(batch, grad_idx) if grad_idx is not None else batch
@@ -1206,71 +1227,78 @@ def main():
             minibatch = with_sharding_constraint(minibatch, batch_spec)
             # only 1 single rng per grad step, let us handle larger batch size (not sure why)
             dropout_rng, _ = jax.random.split(dropout_rng)
-
+            
             if use_vmap_trick:
                 # "vmap trick", calculate loss and grads independently per dp_device
-                loss, grads = jax.vmap(
-                    grad_fn, in_axes=(None, 0, None), out_axes=(0, 0)
-                )(state.params, minibatch, dropout_rng)
+                (loss, new_batch_stats), grads = jax.vmap(
+                    grad_fn, in_axes=(None, 0, None, None), out_axes=((0,0), 0)
+                )(state.params, minibatch, dropout_rng, batch_stats)
                 # ensure they are sharded correctly
+
                 loss = with_sharding_constraint(loss, batch_spec)
                 grads = with_sharding_constraint(grads, grad_param_spec)
+                new_batch_stats = with_sharding_constraint(new_batch_stats, grad_batchstats_spec)
                 # average across all devices
                 # Note: we could average per device only after gradient accumulation, right before params update
-                loss, grads = jax.tree_util.tree_map(
-                    lambda x: jnp.mean(x, axis=0), (loss, grads)
+                loss, grads, new_batch_stats = jax.tree_util.tree_map(
+                    lambda x: jnp.mean(x, axis=0), (loss, grads, new_batch_stats)
                 )
             else:
                 # "vmap trick" does not work in multi-hosts and requires too much hbm
-                loss, grads = grad_fn(state.params, minibatch, dropout_rng)
+                (loss, new_batch_stats), grads = grad_fn(state.params, minibatch, dropout_rng, batch_stats)
             # ensure grads are sharded
-            grads = with_sharding_constraint(grads, param_spec)
+            grads = with_sharding_constraint(grads, state_spec.params)
             # return loss and grads
-            return loss, grads, dropout_rng
+            return loss, grads, new_batch_stats, dropout_rng
 
         if training_args.gradient_accumulation_steps == 1:
-            loss, grads, dropout_rng = loss_and_grad(None, state.dropout_rng)
+
+            loss, grads, new_batch_stats, dropout_rng = loss_and_grad(
+                None, 
+                state.dropout_rng, 
+                state.batch_stats)
         else:
             # create initial state for cumul_minibatch_step loop
             init_minibatch_step = (
                 0.0,
                 with_sharding_constraint(
-                    jax.tree_util.tree_map(jnp.zeros_like, state.params), param_spec
-                ),
+                    jax.tree_util.tree_map(jnp.zeros_like, state.params), state_spec.params
+                ),         
                 state.dropout_rng,
-            )
+                state.batch_stats)
 
             # accumulate gradients
             def cumul_minibatch_step(grad_idx, cumul_loss_grad_dropout):
-                cumul_loss, cumul_grads, dropout_rng = cumul_loss_grad_dropout
-                loss, grads, dropout_rng = loss_and_grad(grad_idx, dropout_rng)
+                cumul_loss, cumul_grads, dropout_rng, batch_stats = cumul_loss_grad_dropout
+                loss, grads, new_batch_stats, dropout_rng = loss_and_grad(grad_idx, dropout_rng, batch_stats)
                 cumul_loss, cumul_grads = jax.tree_util.tree_map(
                     jnp.add, (cumul_loss, cumul_grads), (loss, grads)
                 )
-                cumul_grads = with_sharding_constraint(cumul_grads, param_spec)
-                return cumul_loss, cumul_grads, dropout_rng
+                cumul_grads = with_sharding_constraint(cumul_grads, state_spec.params)
+                new_batch_stats = with_sharding_constraint(new_batch_stats, state_spec.batch_stats)
+                return cumul_loss, cumul_grads, dropout_rng, new_batch_stats
 
             # loop over gradients
-            loss, grads, dropout_rng = jax.lax.fori_loop(
+            loss, grads, dropout_rng, new_batch_stats = jax.lax.fori_loop(
                 0,
                 training_args.gradient_accumulation_steps,
                 cumul_minibatch_step,
                 init_minibatch_step,
             )
-            grads = with_sharding_constraint(grads, param_spec)
+            grads = with_sharding_constraint(grads, state_spec.params)
             # sum -> mean
             loss, grads = jax.tree_util.tree_map(
                 lambda x: x / training_args.gradient_accumulation_steps, (loss, grads)
             )
 
-        grads = with_sharding_constraint(grads, param_spec)
-
+        grads = with_sharding_constraint(grads, state_spec.params)
         # update state
         state = state.apply_gradients(
             grads=grads,
             dropout_rng=dropout_rng,
             train_time=train_time,
             train_samples=state.train_samples + batch_size_per_step,
+            batch_stats = new_batch_stats
         )
 
         metrics = {
@@ -1291,6 +1319,7 @@ def main():
         params = trainable_params(state.params, training_args.embeddings_only)
         grads = trainable_params(grads, training_args.embeddings_only)
         if training_args.log_norm_steps:
+
             zeros_norm = jax.tree_util.tree_map(lambda _: jnp.float32(0), params)
 
             def norm(val):
@@ -1311,6 +1340,7 @@ def main():
             )
 
         if training_args.log_histogram_steps:
+
             zeros_hist = jax.tree_util.tree_map(
                 lambda _: jnp.histogram(jnp.zeros(1), density=True), params
             )
@@ -1334,6 +1364,7 @@ def main():
                 }
             )
 
+
         return state, metrics
 
     # Define eval fn
@@ -1351,7 +1382,11 @@ def main():
     def eval_step(state, batch):
         def compute_eval_loss(batch):
             batch, labels = batch.pop("labels")
-            logits = eval_model(**batch, params=state.params, train=False)[0]
+            if state.batch_stats is not None:
+                logits = eval_model(**batch, params= {'params':state.params, 'batch_stats': state.batch_stats}, train=False)[0]
+            else:
+                logits = eval_model(**batch, params= {'params':state.params}, train=False)[0]
+
             return loss_fn(logits, labels)
 
         if use_vmap_trick:
@@ -1441,6 +1476,7 @@ def main():
                         if prefix is not None:
                             k = f"{prefix}/{k}"
                         log_metrics[k] = v
+
                 wandb.log({**log_metrics, **self.state_dict})
 
     # keep local copy of state
@@ -1536,7 +1572,7 @@ def main():
             metrics_logger.log_time("eval", time.perf_counter() - start_eval_time)
 
             return eval_metrics
-
+    # YiYi notes: need to be fixed to save the mutable 
     def run_save_model(state, eval_metrics=None):
         if jax.process_index() == 0:
 
@@ -1645,6 +1681,7 @@ def main():
             metrics_logger.log({})
 
             if training_args.do_train:
+                
                 # load data - may be replicated on multiple nodes
                 node_groups = max(
                     1, training_args.mp_devices // jax.local_device_count()
@@ -1697,9 +1734,9 @@ def main():
                     )
                     # freeze batch to pass safely to jax transforms
                     batch = freeze(batch)
-
                     # train step
                     state, train_metrics = p_train_step(state, batch, train_time)
+
                     local_state["step"] += 1
                     local_state["train_time"] = train_time
                     local_state["train_samples"] += batch_size_per_step

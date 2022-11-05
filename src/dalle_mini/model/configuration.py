@@ -140,6 +140,7 @@ class DalleBartConfig(PretrainedFromWandbMixin, PretrainedConfig):
         self.init_std = init_std
         self.use_cache = use_cache
         self.gradient_checkpointing = gradient_checkpointing
+     
         # all layers are the same in most configurations
         self.use_scan = use_scan if use_scan is not None else ln_positions != "swinv2"
         assert not (

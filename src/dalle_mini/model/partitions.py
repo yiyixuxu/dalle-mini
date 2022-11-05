@@ -38,6 +38,7 @@ def _get_partition_rules():
         # embeddings
         (("embed_positions", "embedding"), P("mp", None)),
         (("embed_tokens", "embedding"), P("mp", None)),
+        (("Ngrammer_0","Embed_0", "embedding"),P("mp", None)),
         (("rel_bias", "embedding"), P(None, "mp")),
         # attention
         (("(q_proj|k_proj|v_proj)", "kernel"), P(None, "mp")),
@@ -52,6 +53,8 @@ def _get_partition_rules():
         (("lm_head", "kernel"), P(None, "mp")),
         # head scale and tau
         (("(head_scale|tau)",), None),
+        # ngrammer codebook
+        (("ngrammer","ProductQuantization_0","means"), P(None, 'mp', None))
     ]
 
 

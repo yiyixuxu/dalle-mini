@@ -23,7 +23,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from einops import rearrange
-from flax.core.frozen_dict import unfreeze
+from flax.core.frozen_dict import unfreeze, freeze, FrozenDict
 from flax.linen import combine_masks, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.linen.linear import PrecisionLike
@@ -43,11 +43,14 @@ from transformers.models.bart.modeling_flax_bart import (
     FlaxBartForConditionalGeneration,
     FlaxBartForConditionalGenerationModule,
     FlaxBartModule,
+    shift_tokens_right
 )
 from transformers.utils import logging
 
 from .configuration import DalleBartConfig
 from .utils import PretrainedFromWandbMixin
+from .n_grammer_flax import PQNgrammer
+
 
 logger = logging.get_logger(__name__)
 
@@ -1143,6 +1146,16 @@ class FlaxBartEncoder(nn.Module):
                 embed_dim,
                 embedding_init=jax.nn.initializers.normal(self.config.init_std),
             )
+        
+        if self.config.use_ngrammer:
+            self.ngrammer = PQNgrammer(
+                num_clusters = self.config.unigram_vocab_size,
+                num_heads = self.config.ngram_num_heads, 
+                dim_per_head = embed_dim//self.config.ngram_num_heads,
+                ngram_vocab_size = self.config.ngram_vocab_size,
+                ngram_emb_dim= self.config.ngram_emb_dim,
+                decay = 0.99)
+    
         self.layers = FlaxBartEncoderLayerCollection(self.config, self.dtype)
         self.layernorm_embedding = norm(
             self.config.ln_type, dtype=self.dtype, epsilon=1e-05
@@ -1173,6 +1186,9 @@ class FlaxBartEncoder(nn.Module):
         input_ids = input_ids.reshape(-1, input_shape[-1])
 
         hidden_states = self.embed_tokens(input_ids) * self.embed_scale
+        
+        if self.config.use_ngrammer:
+            hidden_states = self.ngrammer(hidden_states, train = not deterministic)
 
         if self.config.use_absolute_position_embeddings:
             embed_pos = self.embed_positions(position_ids + self.offset)
@@ -1941,3 +1957,103 @@ class DalleBart(PretrainedFromWandbMixin, FlaxBartForConditionalGeneration):
             state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
 
         return FlaxSampleOutput(sequences=state.sequences)
+    
+    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
+        # init input tensors
+        input_ids = jnp.zeros(input_shape, dtype="i4")
+        # make sure initialization pass will work for FlaxBartForSequenceClassificationModule
+        input_ids = input_ids.at[(..., -1)].set(self.config.eos_token_id)
+        attention_mask = jnp.ones_like(input_ids)
+        decoder_input_ids = input_ids
+        decoder_attention_mask = jnp.ones_like(input_ids)
+
+        batch_size, sequence_length = input_ids.shape
+        position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+        decoder_position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+
+        params_rng, dropout_rng, batch_stats_rng = jax.random.split(rng, 3)
+
+
+        rngs = {"params": params_rng, "dropout": dropout_rng, 'batch_stats': batch_stats_rng}
+        
+        random_variables = self.module.init(
+            rngs,
+            input_ids,
+            attention_mask,
+            decoder_input_ids,
+            decoder_attention_mask,
+            position_ids,
+            decoder_position_ids,
+        )
+        
+
+        if params is not None:
+            random_variables = flatten_dict(unfreeze(random_variables))
+            params = flatten_dict(unfreeze(params))
+            for missing_key in self._missing_keys:
+                params[missing_key] = random_variables[missing_key]
+            self._missing_keys = set()
+            return freeze(unflatten_dict(params))
+        else:
+            return random_variables
+    
+    def __call__(
+        self,
+        input_ids: jnp.ndarray,
+        attention_mask: Optional[jnp.ndarray] = None,
+        decoder_input_ids: Optional[jnp.ndarray] = None,
+        decoder_attention_mask: Optional[jnp.ndarray] = None,
+        position_ids: Optional[jnp.ndarray] = None,
+        decoder_position_ids: Optional[jnp.ndarray] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        train: bool = False,
+        params: dict = None,
+        dropout_rng: PRNGKey = None,
+        mutable: Any = False
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        # prepare encoder inputs
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
+        if position_ids is None:
+            batch_size, sequence_length = input_ids.shape
+            position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
+
+        # prepare decoder inputs
+        if decoder_input_ids is None:
+            decoder_input_ids = shift_tokens_right(
+                input_ids, self.config.pad_token_id, decoder_start_token_id=self.config.decoder_start_token_id
+            )
+        if decoder_attention_mask is None:
+            decoder_attention_mask = jnp.ones_like(decoder_input_ids)
+        if decoder_position_ids is None:
+            batch_size, sequence_length = decoder_input_ids.shape
+            decoder_position_ids = jnp.broadcast_to(
+                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+            )
+       
+        # Handle any PRNG if needed
+        rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
+
+        return self.module.apply(
+                params or self.params,
+                input_ids=jnp.array(input_ids, dtype="i4"),
+                attention_mask=jnp.array(attention_mask, dtype="i4"),
+                position_ids=jnp.array(position_ids, dtype="i4"),
+                decoder_input_ids=jnp.array(decoder_input_ids, dtype="i4"),
+                decoder_attention_mask=jnp.array(decoder_attention_mask, dtype="i4"),
+                decoder_position_ids=jnp.array(decoder_position_ids, dtype="i4"),
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                deterministic=not train,
+                rngs=rngs,
+                mutable=mutable
+        )

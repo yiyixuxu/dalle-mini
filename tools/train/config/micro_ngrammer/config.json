@@ -27,5 +27,9 @@
   "scale_embedding": false,
   "tie_word_embeddings": false,
   "use_cache": true,
-  "use_ngrammer": false
+  "use_ngrammer": true,
+  "unigram_vocab_size": 4096,
+  "ngram_vocab_size": 196608,
+  "ngram_num_heads": 2,
+  "ngram_emb_dim": 64
 }

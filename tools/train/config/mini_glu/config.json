@@ -26,5 +26,6 @@
   "scale_embedding": false,
   "tie_word_embeddings": false,
   "use_scan": false,
-  "use_cache": true
+  "use_cache": true,
+  "use_ngrammer": false
 }
