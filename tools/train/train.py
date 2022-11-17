@@ -343,12 +343,25 @@ class TrainingArguments:
     learning_rate: float = field(
         default=5e-5, metadata={"help": "The initial learning rate."}
     )
+
+    ngram_learning_rate: float = field(
+        default=1e-1, metadata={"help": "The initial learning rate."}
+    )
+
     optim: str = field(
         default="distributed_shampoo",
         metadata={
             "help": 'The optimizer to use. Can be "distributed_shampoo" (default), "adam" or "adafactor"'
         },
     )
+    
+    ngram_optim: str = field(
+        default="adagrad",
+        metadata={
+            "help": 'The optimizer to use. Can be "adagrad" (default),  "distributed_shampoo", "adam" or "adafactor"'
+        },
+    )
+
     weight_decay: float = field(
         default=0.0, metadata={"help": "Weight decay applied to parameters."}
     )
@@ -816,11 +829,11 @@ def main():
         )
 
     # Create learning rate schedule
-    def create_learning_rate_fn() -> Callable[[int], jnp.array]:
+    def create_learning_rate_fn(lr) -> Callable[[int], jnp.array]:
         """Create the learning rate function."""
         warmup_fn = optax.linear_schedule(
             init_value=0.0,
-            end_value=training_args.learning_rate,
+            end_value=lr,
             transition_steps=training_args.warmup_steps + 1,  # ensure not 0
         )
         last_boundary = training_args.warmup_steps
@@ -838,13 +851,13 @@ def main():
                 num_train_steps is not None
             ), "linear decay requires knowing the dataset length"
             decay_fn = optax.linear_schedule(
-                init_value=training_args.learning_rate,
+                init_value=lr,
                 end_value=0,
                 transition_steps=num_train_steps - training_args.warmup_steps,
             )
         elif training_args.lr_decay == "exponential":
             decay_fn = optax.exponential_decay(
-                init_value=training_args.learning_rate,
+                init_value=lr,
                 transition_steps=training_args.lr_transition_steps,
                 decay_rate=training_args.lr_decay_rate,
                 staircase=training_args.lr_staircase,
@@ -855,12 +868,13 @@ def main():
         )
         return schedule_fn
 
-    learning_rate_fn = create_learning_rate_fn()
+    learning_rate_fn = create_learning_rate_fn(training_args.learning_rate)
 
     # create optimizer
     trainable_params_shape = trainable_params(
         params_shape["params"], training_args.embeddings_only
     )
+
     if training_args.optim == "distributed_shampoo":
         # parameters from https://github.com/tensorflow/lingvo/blob/03ee9d7cd50764b0424c7c863733c91fc0b053ec/lingvo/jax/optimizers.py#L729
         graft_type = {
@@ -948,6 +962,20 @@ def main():
         )
         optimizer = {k: optimizer for k in split_params(trainable_params_shape)}
 
+    # create multi_transform if use n_grammer 
+    def create_label_fn(fn):
+        def label_fn(params_dict):
+            result = {k: fn(k) for k, _ in traverse_util.flatten_dict(params_dict).items()}
+            return freeze(traverse_util.unflatten_dict(result))
+        return label_fn
+    
+    if model.config.use_ngrammer and training_args.ngram_optim == 'adagrad':
+        label_fn = create_label_fn(lambda k: 'ngram_optim' if 'Ngrammer_0' in k and 'embedding' in k else 'optim')
+        ngram_learning_rate_fn = create_learning_rate_fn(training_args.ngram_learning_rate)
+        ngram_optimizer = optax.adagrad(learning_rate=ngram_learning_rate_fn)
+        optimizer = {k: optax.multi_transform({'optim': w , 'ngram_optim': ngram_optimizer},
+                           label_fn) for k, w in optimizer.items()}
+    
     # get PartitionSpec for optimizer state
     def get_opt_state_spec_and_shape():
         # get opt_state shape without actual init
@@ -972,6 +1000,7 @@ def main():
                     # other variables such as count
                     return None
 
+
             split_spec = split_params(set_partitions(trainable_params_shape, False))
             opt_state_spec = {}
             for k, p in split_params(trainable_params_shape).items():
@@ -980,7 +1009,20 @@ def main():
                         lambda x: jax.tree_util.tree_map(lambda y: y[0], x), p
                     )
                 if training_args.optim == "adam":
-                    opt_state_spec[k] = jax.tree_util.tree_map(
+                    # if we set model.config.use_ngrammer and training_args.ngram_optim == 'adagrad', our opt_state is a MultiTransformState
+                    if isinstance(opt_state_shape[k], optax.MultiTransformState):
+                        opt_state_spec[k] = optax.MultiTransformState(
+                            inner_states = {
+                                'ngram_optim': None,
+                                'optim': jax.tree_util.tree_map(
+                                    partial(_opt_state_spec_per_leaf, spec=jax.tree_map(lambda l, s: s if l == 'optim' else None, label_fn(p), split_spec[k])),
+                                    opt_state_shape[k].inner_states['optim'],
+                                    # return None spec for empty elements
+                                    is_leaf=lambda x: isinstance(x, (FrozenDict, optax.EmptyState)),
+                                    )
+                                    })
+                    else:
+                        opt_state_spec[k] = jax.tree_util.tree_map(
                         partial(_opt_state_spec_per_leaf, spec=split_spec[k]),
                         opt_state_shape[k],
                         # return None spec for empty elements
@@ -992,6 +1034,12 @@ def main():
                         split_spec[k],
                         statistics_partition_spec,
                     )
+                    if isinstance(opt_state_shape[k], optax.MultiTransformState):
+                        opt_state_spec[k].stats.local_stats['model']['encoder']['ngrammer']['Ngrammer_0']['Embed_0']['embedding'] = PartitionSpec()
+                        opt_state_spec[k] =  optax.MultiTransformState(
+                            inner_states = {
+                                'ngram_optim': None,
+                                'optim': opt_state_spec[k]})
                 # add dimension for scanned params
                 if "scanned" in k:
                     opt_state_spec[k] = jax.tree_util.tree_map(
