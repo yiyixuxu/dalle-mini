@@ -6,12 +6,12 @@
   "d_model": 1024,
   "decoder_attention_heads": 16,
   "decoder_ffn_dim": 2730,
-  "decoder_layers": 2,
+  "decoder_layers": 12,
   "decoder_start_token_id": 16384,
   "dropout": 0.0,
   "encoder_attention_heads": 16,
   "encoder_ffn_dim": 2730,
-  "encoder_layers": 2,
+  "encoder_layers": 12,
   "encoder_vocab_size": 50300,
   "eos_token_id": 16385,
   "gradient_checkpointing": false,
@@ -28,9 +28,8 @@
   "use_scan": false,
   "use_cache": true,
   "use_ngrammer": true,
-  "unigram_vocab_size": 8192,
-  "ngram_vocab_size": 393216, 
+  "unigram_vocab_size": 4096,
+  "ngram_vocab_size": 196608, 
   "ngram_num_heads": 8,
-  "ngram_emb_dim": 64 
+  "ngram_emb_dim": 16 
 }
-

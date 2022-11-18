@@ -45,7 +45,7 @@ from flax.training.common_utils import onehot
 from jax.experimental import PartitionSpec, maps
 from jax.experimental.compilation_cache import compilation_cache as cc
 from jax.experimental.pjit import pjit, with_sharding_constraint
-from scalable_shampoo.distributed_shampoo import GraftingType, distributed_shampoo
+from scalable_shampoo.distributed_shampoo import GraftingType, distributed_shampoo, ShampooState
 from tqdm import tqdm
 from transformers import HfArgumentParser
 
@@ -67,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 cc.initialize_cache("jax_cache")
 
+import os
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
 
 @dataclass
 class ModelArguments:
@@ -645,6 +647,20 @@ def init_embeddings(model, params):
     model._missing_keys = init_keys
     return model.init_weights(model.key, model.input_shape, params=params)
 
+# YiYi: this is used to create label_fn for optax.multi_transform()
+def create_update_fn(fn):
+    """Create a function to update FrozenDict
+
+    Args:
+      fn: a function that take a pair of key and value from a FrozenDict and return a updated value.
+
+    Returns:
+      a function that takes a FrozenDict as input and return a new FrozenDict with its value updated with fn
+    """
+    def update_fn(params_dict):
+        result = {k: fn(k,v) for k, v in traverse_util.flatten_dict(params_dict).items()}
+        return freeze(traverse_util.unflatten_dict(result))
+    return update_fn
 
 def main():
     # See all possible arguments by passing the --help flag to this script.
@@ -963,14 +979,14 @@ def main():
         optimizer = {k: optimizer for k in split_params(trainable_params_shape)}
 
     # create multi_transform if use n_grammer 
-    def create_label_fn(fn):
-        def label_fn(params_dict):
-            result = {k: fn(k) for k, _ in traverse_util.flatten_dict(params_dict).items()}
-            return freeze(traverse_util.unflatten_dict(result))
-        return label_fn
+    
+    def is_ngram_emb(k):
+        if 'Ngrammer_0' in k and 'embedding' in k:
+            return True 
+        return False
     
     if model.config.use_ngrammer and training_args.ngram_optim == 'adagrad':
-        label_fn = create_label_fn(lambda k: 'ngram_optim' if 'Ngrammer_0' in k and 'embedding' in k else 'optim')
+        label_fn = create_update_fn(lambda k, _ : 'ngram_optim' if is_ngram_emb(k) else 'optim')
         ngram_learning_rate_fn = create_learning_rate_fn(training_args.ngram_learning_rate)
         ngram_optimizer = optax.adagrad(learning_rate=ngram_learning_rate_fn)
         optimizer = {k: optax.multi_transform({'optim': w , 'ngram_optim': ngram_optimizer},
@@ -1029,17 +1045,27 @@ def main():
                         is_leaf=lambda x: isinstance(x, (FrozenDict, optax.EmptyState)),
                     )
                 elif training_args.optim == "distributed_shampoo":
+                    # a ShampooState contains specs
                     opt_state_spec[k] = opt_fn[k].pspec_fn(
                         p,
                         split_spec[k],
                         statistics_partition_spec,
                     )
                     if isinstance(opt_state_shape[k], optax.MultiTransformState):
-                        opt_state_spec[k].stats.local_stats['model']['encoder']['ngrammer']['Ngrammer_0']['Embed_0']['embedding'] = PartitionSpec()
+                        # use the udpate_fn to update ShampooState.stats.local_stats (a FrozenDict),
+                        ## set all the leaves in the n-grammer embedding layer as None
+                        update_fn = create_update_fn(lambda k, w:  None if is_ngram_emb(k) else w)
+                        shampoo_spec = jax.tree_util.tree_map(
+                            lambda x: update_fn(opt_state_spec[k].stats.local_stats) if isinstance(x, FrozenDict) else x, 
+                            opt_state_spec[k], # ShampooState
+                            is_leaf=lambda x: isinstance(x, (FrozenDict, optax.EmptyState)),)
                         opt_state_spec[k] =  optax.MultiTransformState(
                             inner_states = {
                                 'ngram_optim': None,
-                                'optim': opt_state_spec[k]})
+                                'optim': jax.tree_map(lambda x: shampoo_spec if isinstance(x, ShampooState) else None,
+                                opt_state_shape[k].inner_states['optim'],
+                                is_leaf=lambda x: isinstance(x, ShampooState))})
+                        
                 # add dimension for scanned params
                 if "scanned" in k:
                     opt_state_spec[k] = jax.tree_util.tree_map(
