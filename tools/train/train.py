@@ -67,8 +67,9 @@ logger = logging.getLogger(__name__)
 
 cc.initialize_cache("jax_cache")
 
-import os
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+# testing local
+# import os
+# os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
 
 @dataclass
 class ModelArguments:
